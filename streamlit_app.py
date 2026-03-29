@@ -10,59 +10,58 @@ import tempfile
 from streamlit_image_coordinates import streamlit_image_coordinates
 
 # --- Constants & Config ---
-st.set_page_config(page_title="Logo 精修台 v14 (Web)", layout="wide", page_icon="🪄")
+st.set_page_config(
+    page_title="KouLogo AI 精修台",
+    layout="wide",
+    page_icon="🪄",
+    initial_sidebar_state="collapsed"
+)
 
-# --- Performance Optimizations ---
+# --- Memory & Cache ---
 
 @st.cache_resource
 def get_rembg_session(model_name):
     from rembg import new_session
     return new_session(model_name)
 
-def get_checkerboard(width, height, size=15):
+@st.cache_data
+def get_checkerboard(width, height, size=18):
     """Generate a checkerboard background image."""
-    c1, c2 = (255, 255, 255), (220, 220, 220)
+    c1, c2 = (245, 245, 245), (210, 210, 210)
     tile = np.zeros((size*2, size*2, 3), dtype=np.uint8)
     tile[:size, :size] = c1
     tile[size:, size:] = c1
     tile[:size, size:] = c2
     tile[size:, :size] = c2
-    
-    # Tile it to cover the image size
     repeat_x = (width // (size*2)) + 1
     repeat_y = (height // (size*2)) + 1
     board = np.tile(tile, (repeat_y, repeat_x, 1))
     return board[:height, :width]
 
-# --- Core Logic (Adapted from main.py) ---
+# --- Core Processing Logic ---
 
 def apply_color_purify(cv_image_rgba, n_colors, mask=None):
     bgr = cv_image_rgba[:, :, :3]
     alpha = cv_image_rgba[:, :, 3]
-    if mask is not None: visible = (alpha > 0) & (mask > 0)
-    else: visible = alpha > 0
+    visible = (alpha > 0) & (mask > 0) if mask is not None else alpha > 0
     pixels = bgr[visible].astype(np.float32)
     if len(pixels) < 2: return cv_image_rgba
-    n = max(1, min(n_colors, len(pixels)))
-    model = MiniBatchKMeans(n_clusters=n, random_state=42, batch_size=2048, n_init=3)
+    model = MiniBatchKMeans(n_clusters=max(1, min(n_colors, len(pixels))), random_state=42, batch_size=2048, n_init=3)
     labels = model.fit_predict(pixels)
     centers = np.clip(model.cluster_centers_, 0, 255).astype(np.uint8)
-    out_rgba = cv_image_rgba.copy()
-    out_rgba[visible, :3] = centers[labels]
-    return out_rgba
+    out = cv_image_rgba.copy()
+    out[visible, :3] = centers[labels]
+    return out
 
-def apply_edge_preserving_denoise(cv_image_rgba, strength, mask=None):
+def apply_edge_preserving_denoise(cv_image_rgba, mask=None):
     bgr = cv_image_rgba[:, :, :3]
-    if strength <= 0: return cv_image_rgba
-    # Smooth parameters for web
-    d, sc, ss = (5, 20, 20) if strength == 1 else (7, 35, 35) if strength == 2 else (9, 50, 50)
-    denoised = cv2.bilateralFilter(bgr, d=d, sigmaColor=sc, sigmaSpace=ss)
-    out_rgba = cv_image_rgba.copy()
-    if mask is not None: out_rgba[mask > 0, :3] = denoised[mask > 0]
-    else: out_rgba[:, :, :3] = denoised
-    return out_rgba
+    denoised = cv2.bilateralFilter(bgr, d=7, sigmaColor=35, sigmaSpace=35)
+    out = cv_image_rgba.copy()
+    if mask is not None: out[mask > 0, :3] = denoised[mask > 0]
+    else: out[:, :, :3] = denoised
+    return out
 
-def apply_black_cleanup(cv_image_rgba, black_thresh, min_area, close_iter, mask=None):
+def apply_black_cleanup(cv_image_rgba, black_thresh, mask=None):
     bgr = cv_image_rgba[:, :, :3]
     alpha = cv_image_rgba[:, :, 3]
     gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
@@ -70,116 +69,96 @@ def apply_black_cleanup(cv_image_rgba, black_thresh, min_area, close_iter, mask=
     num, labels, stats, _ = cv2.connectedComponentsWithStats(dark_mask, connectivity=8)
     clean_mask = np.zeros_like(dark_mask)
     for i in range(1, num):
-        if stats[i, cv2.CC_STAT_AREA] >= min_area: clean_mask[labels == i] = 255
-    if close_iter > 0:
-        k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
-        clean_mask = cv2.morphologyEx(clean_mask, cv2.MORPH_CLOSE, k, iterations=close_iter)
-    out_rgba = cv_image_rgba.copy()
+        if stats[i, cv2.CC_STAT_AREA] >= 8: clean_mask[labels == i] = 255
+    out = cv_image_rgba.copy()
     eff = clean_mask > 0
     if mask is not None: eff = eff & (mask > 0)
-    out_rgba[eff, :3] = (0, 0, 0)
-    return out_rgba
+    out[eff, :3] = (0, 0, 0)
+    return out
 
-def apply_edge_smoothing(cv_image_rgba, mode, strength, mask=None):
-    alpha = cv_image_rgba[:, :, 3].copy()
+def apply_edge_smoothing(cv_image_rgba, strength):
+    alpha = cv_image_rgba[:, :, 3]
     obj_mask = (alpha > 0).astype(np.uint8) * 255
     if np.count_nonzero(obj_mask) == 0: return cv_image_rgba
-    if mode == "柔和曲线":
-        k1 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
-        dilated = cv2.dilate(obj_mask, k1, iterations=1)
-        ksize = max(3, int(round(strength * 2)) * 2 + 1)
-        blurred = cv2.GaussianBlur(dilated, (ksize, ksize), sigmaX=max(0.8, strength))
-        smoothed = cv2.threshold(blurred, 64, 255, cv2.THRESH_BINARY)[1]
-    else:
-        contours, _ = cv2.findContours(obj_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
-        smoothed = np.zeros_like(obj_mask)
-        for cnt in contours:
-            if cv2.contourArea(cnt) < 4: continue
-            approx = cv2.approxPolyDP(cnt, epsilon=max(0.5, 1.2 * strength), closed=True)
-            cv2.drawContours(smoothed, [approx], -1, 255, thickness=cv2.FILLED)
-    out_rgba = cv_image_rgba.copy()
-    out_rgba[:, :, 3] = smoothed
-    return out_rgba
+    k1 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+    dilated = cv2.dilate(obj_mask, k1, iterations=1)
+    ksize = max(3, int(round(strength * 2)) * 2 + 1)
+    blurred = cv2.GaussianBlur(dilated, (ksize, ksize), sigmaX=max(0.8, strength))
+    smoothed = cv2.threshold(blurred, 64, 255, cv2.THRESH_BINARY)[1]
+    out = cv_image_rgba.copy()
+    out[:, :, 3] = smoothed
+    return out
 
 def apply_defringe(cv_image_rgba, radius, mask=None):
     alpha = cv_image_rgba[:, :, 3]
     obj_mask = (alpha > 0).astype(np.uint8) * 255
-    k_size = radius * 2 + 1
-    k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k_size, k_size))
+    k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (radius * 2 + 1, radius * 2 + 1))
     interior = cv2.erode(obj_mask, k, iterations=1)
     if np.count_nonzero(interior) == 0: interior = obj_mask.copy()
     edge_zone = (obj_mask > 0) & (interior == 0)
     bgr = cv_image_rgba[:, :, :3].astype(np.float32)
-    interior_color = bgr.copy()
-    interior_color[interior == 0] = 0
-    interior_weight = (interior > 0).astype(np.float32)
+    interior_color = bgr.copy(); interior_color[interior == 0] = 0
+    weight = (interior > 0).astype(np.float32)
     blur_k = max(3, radius * 6 + 1) | 1
     spread_color = cv2.GaussianBlur(interior_color, (blur_k, blur_k), radius * 2.0)
-    spread_weight = cv2.GaussianBlur(interior_weight, (blur_k, blur_k), radius * 2.0)
+    spread_weight = cv2.GaussianBlur(weight, (blur_k, blur_k), radius * 2.0)
     safe_w = np.where(spread_weight > 1e-6, spread_weight, 1.0)
     clean_rgb = np.clip(spread_color / safe_w[:, :, None], 0, 255)
     out = cv_image_rgba.copy()
-    zone = edge_zone
-    if mask is not None: zone = zone & (mask > 0)
-    for c in range(3):
-        out[zone, c] = clean_rgb[zone, c].astype(np.uint8)
-        out[alpha == 0, c] = clean_rgb[alpha == 0, c].astype(np.uint8)
+    zone = edge_zone if mask is None else edge_zone & (mask > 0)
+    out[zone, :3] = clean_rgb[zone].astype(np.uint8)
+    out[alpha == 0, :3] = clean_rgb[alpha == 0].astype(np.uint8)
     return out
 
-def apply_rembg_logic(cv_image_rgba, model_name):
+def apply_rembg_logic(cv_image_rgba):
     from rembg import remove
     pil_in = Image.fromarray(cv2.cvtColor(cv_image_rgba, cv2.COLOR_BGRA2RGBA))
-    session = get_rembg_session(model_name)
+    session = get_rembg_session("u2net")
     pil_out = remove(pil_in, session=session)
-    new_alpha = np.array(pil_out)[:, :, 3]
     out = cv_image_rgba.copy()
-    out[:, :, 3] = new_alpha
+    out[:, :, 3] = np.array(pil_out)[:, :, 3]
     return out
-
-def convert_to_svg(cv_image_rgba):
-    with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
-        Image.fromarray(cv2.cvtColor(cv_image_rgba, cv2.COLOR_BGRA2RGBA)).save(tmp.name)
-        svg_str = vtracer.convert_image_to_svg(tmp.name)
-        os.unlink(tmp.name)
-    return svg_str
 
 # --- Magic Wand ---
 
 def find_opaque_seed(cv_image_rgba, x, y):
     h, w = cv_image_rgba.shape[:2]
-    if not (0 <= x < w and 0 <= y < h): return None
-    if cv_image_rgba[y, x, 3] >= 10: return x, y
+    if 0 <= x < w and 0 <= y < h and cv_image_rgba[y, x, 3] >= 10: return x, y
     for r in range(1, 9):
-        for dy in range(-r, r + 1):
-            for dx in range(-r, r + 1):
-                if abs(dx) != r and abs(dy) != r: continue
-                nx, ny = x + dx, y + dy
-                if 0 <= nx < w and 0 <= ny < h and cv_image_rgba[ny, nx, 3] >= 10:
-                    return nx, ny
+        for dy in range(-r, r+1):
+            for dx in range(-r, r+1):
+                if abs(dx)!=r and abs(dy)!=r: continue
+                nx, ny = x+dx, y+dy
+                if 0 <= nx < w and 0 <= ny < h and cv_image_rgba[ny, nx, 3] >= 10: return nx, ny
     return None
 
 def compute_selection_mask(cv_image_rgba, x, y, tolerance, contiguous):
-    h, w = cv_image_rgba.shape[:2]
     seed = find_opaque_seed(cv_image_rgba, x, y)
     if not seed: return None
     x, y = seed
     blr = cv2.GaussianBlur(cv_image_rgba[:, :, :3], (3, 3), 0)
     if contiguous:
-        fm = np.zeros((h + 2, w + 2), np.uint8)
-        flags = cv2.FLOODFILL_FIXED_RANGE | cv2.FLOODFILL_MASK_ONLY | (255 << 8)
-        cv2.floodFill(blr, fm, (x, y), (0, 0, 0), (tolerance,) * 3, (tolerance,) * 3, flags)
+        fm = np.zeros((cv_image_rgba.shape[0]+2, cv_image_rgba.shape[1]+2), np.uint8)
+        cv2.floodFill(blr, fm, (x, y), (0,0,0), (tolerance,)*3, (tolerance,)*3, cv2.FLOODFILL_FIXED_RANGE | cv2.FLOODFILL_MASK_ONLY | (255<<8))
         mask = fm[1:-1, 1:-1]
     else:
         sc = blr[y, x].astype(np.int16)
-        lo = np.clip(sc - tolerance, 0, 255).astype(np.uint8)
-        hi = np.clip(sc + tolerance, 0, 255).astype(np.uint8)
-        mask = cv2.inRange(blr, lo, hi)
+        mask = cv2.inRange(blr, np.clip(sc-tolerance,0,255).astype(np.uint8), np.clip(sc+tolerance,0,255).astype(np.uint8))
     mask[cv_image_rgba[:, :, 3] < 10] = 0
     return mask
 
+# --- Utils ---
+
+def scale_image_for_ui(cv_img_rgba, max_size=1200):
+    h, w = cv_img_rgba.shape[:2]
+    if max(h, w) <= max_size: return cv_img_rgba, 1.0
+    scale = max_size / max(h, w)
+    nw, nh = int(w * scale), int(h * scale)
+    return cv2.resize(cv_img_rgba, (nw, nh), interpolation=cv2.INTER_AREA), scale
+
 # --- State ---
+
 if "image" not in st.session_state: st.session_state.image = None
-if "original_image" not in st.session_state: st.session_state.original_image = None
 if "protected_mask" not in st.session_state: st.session_state.protected_mask = None
 if "history" not in st.session_state: st.session_state.history = []
 if "last_click" not in st.session_state: st.session_state.last_click = None
@@ -188,111 +167,140 @@ def push_history():
     if st.session_state.image is not None:
         st.session_state.history.append((st.session_state.image.copy(), 
                                         st.session_state.protected_mask.copy() if st.session_state.protected_mask is not None else None))
-        if len(st.session_state.history) > 20: st.session_state.history.pop(0)
+        if len(st.session_state.history) > 15: st.session_state.history.pop(0)
 
-# --- UI Styles (Light Mode Friendly) ---
+def undo():
+    if st.session_state.history:
+        st.session_state.image, st.session_state.protected_mask = st.session_state.history.pop()
+
+# --- UI Styles ---
+
 st.markdown("""
 <style>
-    .stApp { background-color: #f0f2f6; color: #31333f; }
-    .main { background-color: #ffffff; border-radius: 10px; padding: 2rem; box-shadow: 0 4px 6px rgba(0,0,0,0.05); }
-    .status-bar { background: #e9ecef; padding: 8px 15px; border-radius: 8px; font-family: monospace; font-size: 0.9em; margin-bottom: 12px; border-left: 5px solid #007bff; color: #495057; }
-    .stExpander { border: 1px solid #dee2e6 !important; background-color: #f8f9fa !important; border-radius: 8px; }
-    .stRadio label, .stSlider label { font-weight: 600 !important; color: #495057 !important; }
+    @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;600;800&display=swap');
+    html, body, [class*="css"] { font-family: 'Inter', sans-serif; }
+    .stApp { background-color: #f8f9fa; }
+    .main-container { background: white; border-radius: 12px; padding: 1.5rem; box-shadow: 0 10px 25px rgba(0,0,0,0.05); }
+    .sidebar-panel { background: #ffffff; padding: 1rem; border-radius: 10px; border: 1px solid #eee; }
+    .tool-btn { border-radius: 8px; margin-bottom: 5px; }
+    .status-badge { background: #eef2f7; color: #4b5563; padding: 4px 12px; border-radius: 20px; font-size: 0.8em; font-weight: 600; border: 1px solid #e2e8f0; }
+    .stButton>button { border-radius: 8px; font-weight: 600; transition: all 0.2s; }
+    .stButton>button:hover { transform: translateY(-1px); box-shadow: 0 4px 12px rgba(0,0,0,0.1); }
+    div[data-testid="stExpander"] { border: none !important; background: #f9fafb !important; border-radius: 10px !important; margin-bottom: 0.5rem !important; }
+    .stRadio > div { gap: 10px; }
+    .stRadio label { background: #fff; border: 1px solid #e2e8f0; padding: 8px 16px; border-radius: 8px; cursor: pointer; }
+    .stRadio div[role="radiogroup"] > label[data-baseweb="radio"] { background: white; }
 </style>
 """, unsafe_allow_html=True)
 
-col_ctrl, col_main = st.columns([1, 3])
+# --- App Body ---
+
+col_ctrl, col_main = st.columns([1, 2.8], gap="large")
 
 with col_ctrl:
-    st.title("🪄 Logo 精修")
-    uploaded_file = st.file_uploader("打开图片", type=["png", "jpg", "jpeg", "webp"], label_visibility="collapsed")
+    st.markdown('<h2 style="margin-top:0; font-weight:800; color:#1a202c;">🪄 KouLogo AI</h2>', unsafe_allow_html=True)
     
-    if uploaded_file:
-        file_bytes = np.asarray(bytearray(uploaded_file.read()), dtype=np.uint8)
-        loaded_img = cv2.imdecode(file_bytes, cv2.IMREAD_UNCHANGED)
-        if loaded_img.ndim == 2: loaded_img = cv2.cvtColor(loaded_img, cv2.COLOR_GRAY2BGRA)
-        elif loaded_img.shape[2] == 3:
-            loaded_img = cv2.cvtColor(loaded_img, cv2.COLOR_BGR2BGRA); loaded_img[:, :, 3] = 255
-        if st.session_state.original_image is None or not np.array_equal(st.session_state.original_image, loaded_img):
-            st.session_state.original_image = loaded_img.copy(); st.session_state.image = loaded_img.copy()
-            st.session_state.protected_mask = None; st.session_state.history = []; st.session_state.last_click = None
+    file = st.file_uploader("Upload", type=["png", "jpg", "jpeg", "webp"], label_visibility="collapsed")
+    if file:
+        img = cv2.imdecode(np.asarray(bytearray(file.read()), dtype=np.uint8), cv2.IMREAD_UNCHANGED)
+        if img.ndim == 2: img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGRA)
+        elif img.shape[2] == 3: img = cv2.cvtColor(img, cv2.COLOR_BGR2BGRA); img[:,:,3]=255
+        if st.session_state.image is None or not img.shape == st.session_state.image.shape:
+            st.session_state.image = img.copy(); st.session_state.protected_mask = None; st.session_state.history = []; st.session_state.last_click = None
 
     if st.session_state.image is not None:
-        c1, c2 = st.columns(2)
-        if c1.button("↩ 撤销", disabled=not st.session_state.history): 
-            prev_img, prev_mask = st.session_state.history.pop(); st.session_state.image = prev_img; st.session_state.protected_mask = prev_mask; st.rerun()
-        if c2.button("🗑 清除保护"): push_history(); st.session_state.protected_mask = None; st.rerun()
+        st.markdown("---")
+        h1, h2 = st.columns(2)
+        if h1.button("↩ 撤销", use_container_width=True, disabled=not st.session_state.history): undo(); st.rerun()
+        if h2.button("🗑 清除保护", use_container_width=True): push_history(); st.session_state.protected_mask = None; st.rerun()
 
-        st.divider()
-        st.subheader("🛠 交互工具")
-        tool_mode = st.radio("工具", ["魔棒 (擦除)", "护棒 (保护)", "查看"], horizontal=True)
-        tol = st.slider("容差", 1, 150, 20)
+        st.subheader("🛠 工具箱")
+        tool = st.radio("选择工具", ["魔棒 (擦除)", "护棒 (保护)", "查看"], horizontal=True, label_visibility="collapsed")
+        tol = st.slider("点选容差", 1, 150, 20)
         contig = st.checkbox("仅连接区域", value=False)
         
-        st.divider()
-        st.subheader("⚡ 批量处理")
-        scope = st.selectbox("范围", ["全图", "仅保护区内", "仅非保护区"])
+        st.subheader("⚡ 智能处理")
+        scope = st.selectbox("处理范围", ["全图", "仅保护区内", "仅非保护区"], label_visibility="collapsed")
         
-        def get_mask():
+        def current_mask():
             if scope == "全图": return None
-            h, w = st.session_state.image.shape[:2]
-            if st.session_state.protected_mask is None:
-                return np.zeros((h, w), dtype=np.uint8) if scope == "仅保护区内" else np.ones((h, w), dtype=np.uint8) * 255
-            return st.session_state.protected_mask if scope == "仅保护区内" else cv2.bitwise_not(st.session_state.protected_mask)
+            m = st.session_state.protected_mask if st.session_state.protected_mask is not None else np.zeros(st.session_state.image.shape[:2], np.uint8)
+            return m if scope == "仅保护区内" else cv2.bitwise_not(m)
 
-        with st.expander("AI & 净化"):
-            if st.button("🤖 AI 智能抠图"): push_history(); st.session_state.image = apply_rembg_logic(st.session_state.image, "u2net"); st.rerun()
-            pk = st.number_input("颜色数", 2, 32, 8)
-            if st.button("🎨 纯化颜色"): push_history(); st.session_state.image = apply_color_purify(st.session_state.image, pk, get_mask()); st.rerun()
-        with st.expander("线条 & 边缘"):
-            bt = st.slider("黑线阈值", 20, 180, 80)
-            if st.button("🖊 黑线净化"): push_history(); st.session_state.image = apply_black_cleanup(st.session_state.image, bt, 8, 1, get_mask()); st.rerun()
+        with st.expander("🤖 AI 强力去背 (Rembg)"):
+            if st.button("一键 AI 抠图", use_container_width=True):
+                push_history(); st.session_state.image = apply_rembg_logic(st.session_state.image); st.rerun()
+        
+        with st.expander("🎨 颜色净化 & 线条"):
+            k = st.number_input("保留颜色数", 2, 32, 8)
+            if st.button("🎨 执行颜色纯化", use_container_width=True):
+                push_history(); st.session_state.image = apply_color_purify(st.session_state.image, k, current_mask()); st.rerun()
+            bt = st.slider("黑线净化阈值", 20, 180, 80)
+            if st.button("🖊 增强黑线", use_container_width=True):
+                push_history(); st.session_state.image = apply_black_cleanup(st.session_state.image, bt, current_mask()); st.rerun()
+
+        with st.expander("✨ 边缘平滑 & 去边"):
             sm = st.slider("平滑强度", 0.5, 4.0, 1.0)
-            if st.button("✨ 边缘平滑"): push_history(); st.session_state.image = apply_edge_smoothing(st.session_state.image, "柔和曲线", sm, get_mask()); st.rerun()
-        with st.expander("去燥 & 去边"):
-            if st.button("🔇 保边去噪"): push_history(); st.session_state.image = apply_edge_preserving_denoise(st.session_state.image, 1, get_mask()); st.rerun()
-            dr = st.slider("渗色半径", 1, 12, 3)
-            if st.button("🧹 去边渗色"): push_history(); st.session_state.image = apply_defringe(st.session_state.image, dr, get_mask()); st.rerun()
+            if st.button("✨ 执行边缘平滑", use_container_width=True):
+                push_history(); st.session_state.image = apply_edge_smoothing(st.session_state.image, sm); st.rerun()
+            df = st.slider("去边半径", 1, 12, 3)
+            if st.button("🧹 执行去边渗色", use_container_width=True):
+                push_history(); st.session_state.image = apply_defringe(st.session_state.image, df, current_mask()); st.rerun()
 
-        st.divider()
-        png_io = io.BytesIO(); Image.fromarray(cv2.cvtColor(st.session_state.image, cv2.COLOR_BGRA2RGBA)).save(png_io, format="PNG")
-        st.download_button("💾 下载 PNG", png_io.getvalue(), "output.png", "image/png")
+        st.markdown("---")
+        buf = io.BytesIO(); Image.fromarray(cv2.cvtColor(st.session_state.image, cv2.COLOR_BGRA2RGBA)).save(buf, format="PNG")
+        st.download_button("💾 导出 PNG 结果", buf.getvalue(), "logo_processed.png", "image/png", use_container_width=True)
 
 with col_main:
     if st.session_state.image is not None:
-        h, w = st.session_state.image.shape[:2]
-        st.markdown(f'<div class="status-bar">📏 {w}×{h} px | {"🛡 保护开启" if st.session_state.protected_mask is not None else "⚪ 无保护"}</div>', unsafe_allow_html=True)
+        # Performance: Scale image for UI display only
+        ui_img, ui_scale = scale_image_for_ui(st.session_state.image)
+        h, w = ui_img.shape[:2]
+        oh, ow = st.session_state.image.shape[:2]
         
-        # Prepare for display with Checkerboard
-        img_rgba = st.session_state.image.copy()
-        board = get_checkerboard(w, h)
-        
-        # Blend protection highlighting if active
+        st.markdown(f'<div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:12px;">'
+                    f'<span class="status-badge">📏 {ow}×{oh}</span>'
+                    f'<span class="status-badge" style="background:#def7ec; color:#03543f; border-color:#84e1bc;">{"🛡 区域保护激活" if st.session_state.protected_mask is not None else "⚪ 全图编辑模式"}</span>'
+                    f'</div>', unsafe_allow_html=True)
+
+        # Prepare UI overlays on the Scaled image
+        ui_display = ui_img.copy()
         if st.session_state.protected_mask is not None:
-            mask = (st.session_state.protected_mask > 0) & (img_rgba[:, :, 3] > 0)
-            for c in range(3): img_rgba[mask, c] = (img_rgba[mask, c] * 0.6 + 200 * 0.4).astype(np.uint8)
+            # Scale protected mask for UI display
+            ui_prot = cv2.resize(st.session_state.protected_mask, (w, h), interpolation=cv2.INTER_NEAREST)
+            pm = (ui_prot > 0) & (ui_display[:, :, 3] > 0)
+            for c in range(3): ui_display[pm, c] = (ui_display[pm, c] * 0.6 + 200 * 0.4).astype(np.uint8)
         
-        # Final Blend onto Checkerboard for UI Visibility
-        alpha = img_rgba[:, :, 3] / 255.0
-        display_img = (img_rgba[:, :, :3] * alpha[:, :, np.newaxis] + board * (1 - alpha[:, :, np.newaxis])).astype(np.uint8)
+        board = get_checkerboard(w, h)
+        alpha = ui_display[:, :, 3] / 255.0
+        ui_final = (ui_display[:, :, :3] * alpha[:, :, np.newaxis] + board * (1 - alpha[:, :, np.newaxis])).astype(np.uint8)
         
-        click = streamlit_image_coordinates(Image.fromarray(display_img), key="canvas")
+        # Interactive Canvas (Fast because image is downscaled for transfer)
+        res = streamlit_image_coordinates(Image.fromarray(ui_final), key="main_editor")
         
-        if click and click != st.session_state.last_click:
-            st.session_state.last_click = click
-            vx, vy = click["x"], click["y"]; mask = compute_selection_mask(st.session_state.image, vx, vy, tol, contig)
+        if res and res != st.session_state.last_click:
+            st.session_state.last_click = res
+            # Map UI coordinates back to original high-res dimensions
+            ox, oy = int(res["x"] / ui_scale), int(res["y"] / ui_scale)
+            
+            mask = compute_selection_mask(st.session_state.image, ox, oy, tol, contig)
             if mask is not None:
-                if tool_mode == "魔棒 (擦除)":
-                    push_history(); eff = mask.copy()
+                if "魔棒" in tool:
+                    push_history()
+                    eff = mask.copy()
                     if st.session_state.protected_mask is not None: eff[st.session_state.protected_mask > 0] = 0
-                    st.session_state.image[eff > 0, 3] = 0; st.rerun()
-                elif tool_mode == "护棒 (保护)":
+                    st.session_state.image[eff > 0, 3] = 0
+                    st.rerun()
+                elif "护棒" in tool:
                     push_history()
                     if st.session_state.protected_mask is None: st.session_state.protected_mask = mask
                     else: st.session_state.protected_mask = cv2.bitwise_or(st.session_state.protected_mask, mask)
                     st.rerun()
-        
-        st.info("💡 鼠标点击图片！已为您切换至**浅色主题**并开启了**透明棋盘格**预览。")
+
+        st.markdown('<p style="color:#718096; font-size:0.85em; text-align:center;">💡 提示：点击图片进行魔棒擦除。关闭“仅连接区域”可一次性处理封闭区域。</p>', unsafe_allow_html=True)
     else:
-        st.info("请先上传图片。")
+        st.markdown('<div style="height:400px; display:flex; flex-direction:column; align-items:center; justify-content:center; border:2px dashed #e2e8f0; border-radius:12px; background:#fff;">'
+                    '<p style="color:#a0aec0; font-size:1.2em; font-weight:600;">👋 欢迎使用 KouLogo AI</p>'
+                    '<p style="color:#cbd5e0;">请在左侧上传您的 Logo 开始精修</p>'
+                    '</div>', unsafe_allow_html=True)
         st.image("https://images.unsplash.com/photo-1626785774573-4b799315345d?q=80&w=1000&auto=format&fit=crop", use_container_width=True)
