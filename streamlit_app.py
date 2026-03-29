@@ -26,13 +26,11 @@ def get_rembg_session(model_name):
 
 @st.cache_data
 def get_checkerboard(width, height, size=18):
-    """Generate a checkerboard background image."""
+    """Generate a constant checkerboard background image."""
     c1, c2 = (245, 245, 245), (210, 210, 210)
     tile = np.zeros((size*2, size*2, 3), dtype=np.uint8)
-    tile[:size, :size] = c1
-    tile[size:, size:] = c1
-    tile[:size, size:] = c2
-    tile[size:, :size] = c2
+    tile[:size, :size] = c1; tile[size:, size:] = c1
+    tile[:size, size:] = c2; tile[size:, :size] = c2
     repeat_x = (width // (size*2)) + 1
     repeat_y = (height // (size*2)) + 1
     board = np.tile(tile, (repeat_y, repeat_x, 1))
@@ -41,7 +39,7 @@ def get_checkerboard(width, height, size=18):
 # --- Core Processing Logic ---
 
 def apply_color_purify(cv_image_rgba, n_colors, mask=None):
-    bgr = cv_image_rgba[:, :, :3]
+    bgr = cv_image_rgba[:, :, :3].copy()
     alpha = cv_image_rgba[:, :, 3]
     visible = (alpha > 0) & (mask > 0) if mask is not None else alpha > 0
     pixels = bgr[visible].astype(np.float32)
@@ -136,6 +134,7 @@ def compute_selection_mask(cv_image_rgba, x, y, tolerance, contiguous):
     seed = find_opaque_seed(cv_image_rgba, x, y)
     if not seed: return None
     x, y = seed
+    # Use original pixels for accurate selection, but blurred slightly to handle noise
     blr = cv2.GaussianBlur(cv_image_rgba[:, :, :3], (3, 3), 0)
     if contiguous:
         fm = np.zeros((cv_image_rgba.shape[0]+2, cv_image_rgba.shape[1]+2), np.uint8)
@@ -189,7 +188,6 @@ st.markdown("""
     div[data-testid="stExpander"] { border: none !important; background: #f9fafb !important; border-radius: 10px !important; margin-bottom: 0.5rem !important; }
     .stRadio > div { gap: 10px; }
     .stRadio label { background: #fff; border: 1px solid #e2e8f0; padding: 8px 16px; border-radius: 8px; cursor: pointer; }
-    .stRadio div[role="radiogroup"] > label[data-baseweb="radio"] { background: white; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -254,8 +252,8 @@ with col_ctrl:
 with col_main:
     if st.session_state.image is not None:
         # Performance: Scale image for UI display only
-        ui_img, ui_scale = scale_image_for_ui(st.session_state.image)
-        h, w = ui_img.shape[:2]
+        ui_img_bgr, ui_scale = scale_image_for_ui(st.session_state.image)
+        h, w = ui_img_bgr.shape[:2]
         oh, ow = st.session_state.image.shape[:2]
         
         st.markdown(f'<div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:12px;">'
@@ -263,39 +261,42 @@ with col_main:
                     f'<span class="status-badge" style="background:#def7ec; color:#03543f; border-color:#84e1bc;">{"🛡 区域保护激活" if st.session_state.protected_mask is not None else "⚪ 全图编辑模式"}</span>'
                     f'</div>', unsafe_allow_html=True)
 
-        # Prepare UI overlays on the Scaled image
-        ui_display = ui_img.copy()
+        # CRITICAL FIX: Convert UI BGR to RGB BEFORE blending to prevent Hue Shift
+        ui_img_rgb = cv2.cvtColor(ui_img_bgr[:, :, :3], cv2.COLOR_BGR2RGB)
+        ui_alpha = ui_img_bgr[:, :, 3] / 255.0
+        
+        # Apply Protection Highlight on RGB
         if st.session_state.protected_mask is not None:
-            # Scale protected mask for UI display
             ui_prot = cv2.resize(st.session_state.protected_mask, (w, h), interpolation=cv2.INTER_NEAREST)
-            pm = (ui_prot > 0) & (ui_display[:, :, 3] > 0)
-            for c in range(3): ui_display[pm, c] = (ui_display[pm, c] * 0.6 + 200 * 0.4).astype(np.uint8)
+            pm = (ui_prot > 0) & (ui_alpha > 0)
+            overlay = np.full((h, w, 3), (200, 200, 200), dtype=np.uint8)
+            ui_img_rgb[pm] = (ui_img_rgb[pm] * 0.6 + overlay[pm] * 0.4).astype(np.uint8)
         
         board = get_checkerboard(w, h)
-        alpha = ui_display[:, :, 3] / 255.0
-        ui_final = (ui_display[:, :, :3] * alpha[:, :, np.newaxis] + board * (1 - alpha[:, :, np.newaxis])).astype(np.uint8)
+        # ui_final is RGB
+        ui_final = (ui_img_rgb * ui_alpha[:, :, np.newaxis] + board * (1 - ui_alpha[:, :, np.newaxis])).astype(np.uint8)
         
         # Interactive Canvas (Fast because image is downscaled for transfer)
         res = streamlit_image_coordinates(Image.fromarray(ui_final), key="main_editor")
         
         if res and res != st.session_state.last_click:
             st.session_state.last_click = res
-            # Map UI coordinates back to original high-res dimensions
             ox, oy = int(res["x"] / ui_scale), int(res["y"] / ui_scale)
             
-            mask = compute_selection_mask(st.session_state.image, ox, oy, tol, contig)
-            if mask is not None:
-                if "魔棒" in tool:
-                    push_history()
-                    eff = mask.copy()
-                    if st.session_state.protected_mask is not None: eff[st.session_state.protected_mask > 0] = 0
-                    st.session_state.image[eff > 0, 3] = 0
-                    st.rerun()
-                elif "护棒" in tool:
-                    push_history()
-                    if st.session_state.protected_mask is None: st.session_state.protected_mask = mask
-                    else: st.session_state.protected_mask = cv2.bitwise_or(st.session_state.protected_mask, mask)
-                    st.rerun()
+            with st.spinner("Processing..."):
+                mask = compute_selection_mask(st.session_state.image, ox, oy, tol, contig)
+                if mask is not None:
+                    if "魔棒" in tool:
+                        push_history()
+                        eff = mask.copy()
+                        if st.session_state.protected_mask is not None: eff[st.session_state.protected_mask > 0] = 0
+                        st.session_state.image[eff > 0, 3] = 0
+                        st.rerun()
+                    elif "护棒" in tool:
+                        push_history()
+                        if st.session_state.protected_mask is None: st.session_state.protected_mask = mask
+                        else: st.session_state.protected_mask = cv2.bitwise_or(st.session_state.protected_mask, mask)
+                        st.rerun()
 
         st.markdown('<p style="color:#718096; font-size:0.85em; text-align:center;">💡 提示：点击图片进行魔棒擦除。关闭“仅连接区域”可一次性处理封闭区域。</p>', unsafe_allow_html=True)
     else:
